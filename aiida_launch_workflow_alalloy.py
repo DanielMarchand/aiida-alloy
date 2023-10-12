@@ -127,20 +127,24 @@ def get_nk(num_machines, code):
         else:
             return False
 
-    nk = str(max(4, int(num_machines/2)))  # adhoc guess
+    nk = str(int(num_machines/2))  # adhoc guess
 
-    # check if our choice is valid
-    computer = code.computer
-    ppm = computer.get_default_mpiprocs_per_machine()
-    # if a local computer we set nk = 1
-    if ppm == 1:
-       nk = str(1)
-       return nk
-    nump = num_machines * ppm
-    if not nk_nump_evenlydivisible(nk, nump):
-        raise Exception("Error number processors: {} "
-                        "is not divisible by nk: {}".format(nump, nk))
+    print("WARNING: Skipping manual check for nk divisibility!")
+    ## check if our choice is valid
+    #computer = code.computer
+    #ppm = computer.get_default_mpiprocs_per_machine()
+    #if ppm is None:
+    #    ppm = 1
+    ## if a local computer we set nk = 1
+    #if ppm == 1:
+    #   nk = str(1)
+    #   return nk
+    #nump = num_machines * ppm
+    #if not nk_nump_evenlydivisible(nk, nump):
+    #    raise Exception("Error number processors: {} "
+    #                    "is not divisible by nk: {}".format(nump, nk))
 
+    print("For Nodes={} using nk={}".format(num_machines,nk))
     return nk
 
 def wf_getconventionalstructure(structuredata):
@@ -180,10 +184,11 @@ def wf_getkpoints(aiida_structure, kptper_recipang):
 
     return kpoints
 
-
 def wf_setupparams(base_parameter, structure,
                    pseudo_familyname, nume2bnd_ratio,
-                   cellpress_parameter):
+                   with_simple_spin,
+                   cellpress_parameter,
+                   relax_method=None):
         from aiida.orm.nodes.data.upf import get_pseudos_from_structure
 
         import collections
@@ -199,12 +204,33 @@ def wf_setupparams(base_parameter, structure,
         nelec = get_numelectrons_structure_upffamily(structure, pseudos)
         nbnd = nelec * nume2bnd_ratio.value
         nbnd = max(nbnd, 20) # minimum of 20 bands to avoid certain crashes
+
+        ## for some reason La needs more bands than other elements 
+        #  (I thought this was the case.. but maybe smearing too high!)
+        #nbnd_2x_elements = ['La']
+        #symbols = structure.get_ase().symbols
+        #if any([x in symbols for x in nbnd_2x_elements]):
+        #    nbnd = int(nbnd*2)
+
         parameter_dict = base_parameter.get_dict()
         parameter_dict['SYSTEM']['nbnd'] = nbnd
+        if relax_method is not None:
+            parameter_dict['CONTROL']['calculation'] = relax_method
+        if with_simple_spin:
+            # set nspin
+            parameter_dict['SYSTEM']['nspin'] = 2 
+
+            # set initial magnetism
+            structure_ase = structure.get_ase()
+            mag_dict = {x:0.5 for x in set(structure_ase.get_chemical_symbols())}
+            parameter_dict['SYSTEM']['starting_magnetization'] = mag_dict 
+            
+
 
         cellpress_dict = cellpress_parameter.get_dict()
         parameter_dict.update(cellpress_dict)
         parameters = Dict(dict=parameter_dict)
+
 
         return parameters
 
@@ -237,10 +263,14 @@ def wf_delete_vccards(parameter):
 @click.option('-cm', '--calc_method', default='scf',
               type=click.Choice(["scf", "relax", "vc-relax", "elastic"]),
               help='The type of calculation to perform')
+@click.option('-wsp', '--with_simple_spin', is_flag=True,
+              help='Runs with nspin=2 and sets all starting magnetism to 0.5')
 @click.option('-ucs', '--use_conventional_structure', is_flag=True,
               help='Turns the input structure to its pymatgen conventional form prior to running')
 @click.option('-pct', '--press_conv_thr', default=None,
               help='Specify the pressure conv threshold in Kbar (vc-relax only)')
+@click.option('-ja', '--job_account', default=None,
+              help='account to use when submitting job')
 @click.option('-mws', '--max_wallclock_seconds', default=8*60*60,
               help='maximum wallclock time per job in seconds')
 @click.option('-mac', '--max_active_calculations', default=300,
@@ -283,7 +313,8 @@ def launch(code_node, structure_group_label, workchain_group_label,
            structure_node, base_parameter_node,
            pseudo_familyname, kptper_recipang,
            nume2bnd_ratio, press_conv_thr,
-           calc_method, use_conventional_structure,
+           calc_method, with_simple_spin, use_conventional_structure,
+           job_account,
            max_wallclock_seconds, max_active_calculations, max_active_elastic,
            max_nodes_submit, max_atoms_submit,
            number_of_nodes, memory_gb, ndiag, npools,
@@ -388,7 +419,9 @@ def launch(code_node, structure_group_label, workchain_group_label,
                                     structure,
                                     Str(pseudo_familyname),
                                     Float(nume2bnd_ratio),
-                                    cellpress_parameter)
+                                    Bool(with_simple_spin),
+                                    cellpress_parameter,
+                                    relax_method=calc_method)
 
         # determine kpoint mesh & setup kpoints
         kpoints = wf_getkpoints(structure, Int(kptper_recipang))
@@ -399,15 +432,22 @@ def launch(code_node, structure_group_label, workchain_group_label,
         else:
             num_machines = get_nummachines(structure, pseudo_familyname)
             if calc_method in ['relax', 'vc-relax']:
-               num_machines += 4
+               #num_machines += 4
+               print("WARNING: Will not automatically increase number of nodes for relax job!")
             if num_machines > int(max_nodes_submit):
                 print("{} nodes requested, maximum is {}".format(num_machines, max_nodes_submit))
                 print("If you wish to launch please choose nodes manually with --number_of_nodes")
                 continue
+        print("WARNING: JUST GUESSING NUM_MPIPROCS_PER_MACHINE")
         options_dict = {
             'max_wallclock_seconds': max_wallclock_seconds,
-            'resources': {'num_machines': num_machines},
+            'resources': {'num_machines': num_machines,
+                          'num_mpiprocs_per_machine': 32},
         }
+        if job_account is not None:
+            print("WARNING: overriding custom_scheduler_command")
+            account_cmd = "#SBATCH --account={}".format(job_account)
+            options_dict['custom_scheduler_commands'] = account_cmd
         if memory_gb:
             options_dict['max_memory_kb'] = int(int(memory_gb)*1024*1024)
         if submit_debug:
@@ -417,10 +457,12 @@ def launch(code_node, structure_group_label, workchain_group_label,
             options_dict['queue_name'] = 'debug'
         workchain_options = options_dict
 
-        if npools:
+        if npools is not None:
             nk = npools
+            print("nk manually set to {}".format(npools))
         else:
             nk = get_nk(num_machines, code)
+            print("nk determined to be {}".format(nk))
         settings_dict = {
             'cmdline': ['-nk', nk],
             'no_bands': True
@@ -433,6 +475,10 @@ def launch(code_node, structure_group_label, workchain_group_label,
             settings_dict['fixed_coords'] = coordinate_fix
         settings = Dict(dict=settings_dict)
 
+        # need to set up pseudos earlier 
+        from aiida.orm.nodes.data.upf import get_pseudos_from_structure
+        pseudos = get_pseudos_from_structure(structure, pseudo_familyname)
+
         # setup inputs & submit workchain
         clean_workdir = not keep_workdir
         inputs = {
@@ -442,39 +488,33 @@ def launch(code_node, structure_group_label, workchain_group_label,
             'pw': {
                 'code': code,
                 'parameters': wf_delete_vccards(parameters),
-                'metadata': {'options': workchain_options},
+                'metadata': {'options': workchain_options,
+                             },
                 'settings': settings,
+                'pseudos': pseudos,
+                'overrides': Dict({'delta_factor_mixing_beta':1.0})
             }
         }
         relax_inputs = {
             'base': {k: base_inputs[k]  for k in base_inputs if k != 'parameters'},
-            'relaxation_scheme': Str('relax'),
-            'final_scf' : Bool(False),
-            'meta_convergence' : Bool(False)
+            #'relaxation_scheme': Str('relax'),
+            #'final_scf' : Bool(False),
+            #'meta_convergence' : Bool(False)
         }
         if calc_method == 'scf':
             WorkChain = WorkflowFactory('quantumespresso.pw.base')
             inputs.update(base_inputs)
             inputs['pw']['structure'] = structure
             inputs['kpoints'] = kpoints
-            inputs['pseudo_family'] = Str(pseudo_familyname)
+            #inputs['pseudo_family'] = Str(pseudo_familyname)
         elif calc_method in ['relax', 'vc-relax']:
             WorkChain = WorkflowFactory('quantumespresso.pw.relax')
             inputs.update(relax_inputs)
             inputs['structure'] = structure
             inputs['base']['pseudo_family'] = Str(pseudo_familyname)
             inputs['base']['kpoints'] = kpoints
-            if calc_method == 'relax':
-                inputs['relaxation_scheme'] = Str('relax')
-                parameters = wf_delete_vccards(parameters)
-                inputs['base']['pw']['parameters'] = parameters
-            elif calc_method == 'vc-relax':
-                inputs['relaxation_scheme'] = Str('vc-relax')
-                inputs['base']['pw']['parameters'] = parameters
-            if calc_method == 'elastic':
-                if submit_debug:
-                    print("Using debug queue with elastic workchain is not advised!")
         elif calc_method == 'elastic':
+            raise Exception("Elastic mode calculations no longer supported!")
             WorkChain = WorkflowFactory('elastic')
             inputs['structure'] = structure
 

@@ -4,6 +4,7 @@ aiida.load_profile()
 from aiida.orm import Group
 from aiida.orm import StructureData
 from aiida_create_solutesupercell_structures import *
+from aiida_create_antisite_structures import get_smallestcellindex, generate_supercell
 import ase
 import ase.build
 import click
@@ -87,6 +88,8 @@ def get_strained_structures(equilibrium_structure, norm_strains,
               help='group containing structures to base randomization off of.')
 @click.option('-is', '--input_structures',
               help='A comma-seprated list of nodes/uuid to import')
+@click.option('-tss', '--target_supercellsize', default=None,
+              help="Target size for supercell")
 @click.option('-rs', '--repeat_expansion', default="1,1,1",
               help="A supercell expansion to apply prior to generating the structure")
 @click.option('-vs', '--volumetric_strains', default="0",
@@ -111,7 +114,8 @@ def get_strained_structures(equilibrium_structure, norm_strains,
               help="Description for output AiiDA group")
 @click.option('-dr', '--dryrun', is_flag=True,
               help="Prints structures and extras but does not store anything")
-def launch(input_group, input_structures, repeat_expansion,
+def launch(input_group, input_structures, target_supercellsize,
+           repeat_expansion,
            volumetric_strains, norm_strains, shear_strains,
            random_displacement,
            number_randomized_samples, max_atoms, structure_comments,
@@ -128,6 +132,9 @@ def launch(input_group, input_structures, repeat_expansion,
     else:
         structure_group = None
 
+    if target_supercellsize is not None and repeat_expansion != '1,1,1':
+        raise Exception("Cannot specify both target_supercell and repeat_expansion")
+
     if input_group:
         structure_nodes = Group.get(label=input_group).nodes
     elif input_structures:
@@ -140,6 +147,7 @@ def launch(input_group, input_structures, repeat_expansion,
     shear_strains = [float(x) for x in shear_strains.split(',')]
     repeat_expansion = [int(x) for x in repeat_expansion.split(',')]
 
+
     for structure_node in structure_nodes:
         extras = {
             'input_structure':structure_node.uuid,
@@ -148,13 +156,19 @@ def launch(input_group, input_structures, repeat_expansion,
                       }
 
         input_structure_ase = structure_node.get_ase()
+        input_structure_ase = input_structure_ase.repeat(repeat_expansion)
+        if target_supercellsize is not None:
+            target_supercellsize = int(target_supercellsize)
+            extras['target_supercellsize'] = target_supercellsize
+            input_structure_ase = generate_supercell(
+                                    input_structure_ase, target_supercellsize
+                                    )[1]
         if use_conventional_structure:
            input_structure_ase = get_conventionalstructure(input_structure_ase)
            extras['conventional_structure'] = True
         if len(input_structure_ase) > max_atoms:
             print(("Skipping {} too many atoms".format(structure_node)))
             continue
-        input_structure_ase = input_structure_ase.repeat(repeat_expansion)
         deformations, strained_structures = get_strained_structures(input_structure_ase,
                                                                     norm_strains,
                                                                     shear_strains)

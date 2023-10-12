@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import aiida
 aiida.load_profile()
-from qe_tools import constants
+from qe_tools import CONSTANTS as constants
 from aiida_create_solutesupercell_structures import *
 from aiida.orm import load_node, Node, Group, QueryBuilder
 from aiida.plugins.factories import WorkflowFactory
@@ -206,26 +206,35 @@ def get_timesorted_values(relax_node, arraylabel, np_concatenate=True,
         #if exit_status not in  [0, 400, 500, 501, 520]:
             print("Skipping failed child {} of {}".format(node, relax_node))
             continue
+
         try:
-            num_steps = len(node.outputs.output_trajectory.get_array('steps'))
-            num_energies = len(node.outputs.output_trajectory.get_array('energy'))
+           step_array = node.outputs.output_trajectory.get_array('steps')
+           energy_array = node.outputs.output_trajectory.get_array('energy')
+           child_array = node.outputs.output_trajectory.get_array(arraylabel)
+           num_steps = len(step_array)
         except Exception:
             print("No trjactories in child {} of {}".format(node, relax_node))
             continue
-        if num_steps < num_energies:
-            print("Too many energies in child {} of {}".format(node, relax_node))
+
+        # in new versions of QE, the final cell, positions is not contained in the 
+        # trajectory but for training data it should be enough to snip the last step
+        if len(step_array) == len(child_array) - 1:
+            child_array = child_array[:-1]
+            addextra_vcinfo = False # do not add a final step later 
+
+        if len(child_array) != num_steps:
+            print("ERROR {} does not match number of steps! For {} of {}".format(arraylabel, node, relax_node))
             continue
+
         if num_steps == 1 and check_outputparams:
             output_array.append([node.outputs.output_parameters.get_dict()[arraylabel]])
         else:
-            child_array = node.outputs.output_trajectory.get_array(arraylabel)
             output_array.append(child_array)
 
     # vc-relax nodes are really fussy when it comes to appending to trajectory data
-    if relax_node.exit_status != 0:
+    if relax_node.exit_status != 0 or num_steps == 1:
        addextra_vcinfo = False
-    if num_steps == 1:
-       addextra_vcinfo = False
+
     if addextra_vcinfo and arraylabel in ['steps', 'cells', 'positions']:
         output_array.append([output_array[-1][-1]])
 
@@ -275,7 +284,11 @@ def write_pwrelax_torunner(fileout, relax_node, write_only_relaxed,
     if verbose:
        print('relaxation steps:',len(timesorted_steps))
 
-    final_scf = bool(relax_node.inputs.final_scf)
+    try:
+        final_scf = bool(relax_node.inputs.final_scf)
+    except Exception:
+        final_scf = False 
+
     if not write_only_relaxed:
         trajectory_looprange = list(range(len(timesorted_cells)))
     elif not final_scf:
@@ -423,18 +436,12 @@ def createjob(group_label, filename, write_only_relaxed, energy_tol,
                     print("ERROR WRITING SCFNODE: ",node.uuid)
             elif process_label == "PwRelaxWorkChain":
                 print('using write_pwrelax_torunner')
-                #try:
-                write_pwrelax_torunner(fileout, node,write_only_relaxed,
-                                       energy_tol,verbose)
-                #except AssertionError as e:
-                #    print("ERROR WRITING RELAXNODE: ",node.uuid)
-                #    print(e)
-                #try:
-                #    write_pwrelax_torunner(fileout, node,write_only_relaxed,
-                #                           energy_tol,verbose)
-                #except Exception as e:
-                #    print("ERROR WRITING RELAXNODE: ",node.uuid)
-                #    print(e)
+                try:
+                    write_pwrelax_torunner(fileout, node,write_only_relaxed,
+                                           energy_tol,verbose)
+                except Exception as e:
+                    print("ERROR WRITING RELAXNODE: ",node.uuid)
+                    print(e)
             elif process_label == "ElasticWorkChain":
                 print("recursively adding Elastic nodes")
                 elastic_children = get_outputcalcs(node)
